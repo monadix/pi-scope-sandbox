@@ -1,0 +1,29 @@
+{
+  "name": "pi-scope-sandbox",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Fail-closed Linux Bash sandbox adapter for pi-permission-system",
+  "license": "MIT",
+  "pi": { "extensions": ["./index.ts"] },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "test:native": "PI_SCOPE_NATIVE=1 node --test test/native.test.mjs",
+    "test:pi": "node test/pi-smoke.mjs"
+  },
+  "engines": { "node": ">=24" },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "^1.2.0",
+    "@earendil-works/pi-coding-agent": "^1.2.0",
+    "@gotgenes/pi-permission-system": "^40.2.0",
+    "pi-subagents": "^0.78.0"
+  },
+  "peerDependenciesMeta": { "pi-subagents": { "optional": true } },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.2.0",
+    "@earendil-works/pi-coding-agent": "1.2.0",
+    "@gotgenes/pi-permission-system": "40.2.2",
+    "pi-subagents": "0.78.0",
+    "jiti": "2.7.0"
+  }
+}
