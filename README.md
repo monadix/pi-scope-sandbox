@@ -147,10 +147,14 @@ For one call, request any combination of:
 Read/write resources must be existing absolute files or directories; directories
 are recursive scopes, and writable directories permit creating contained files.
 A writable file grant does not make its parent or siblings writable. Each exact
-resource is canonicalized, validated again after approval, and independently
-passes the permission system's path gate; the complete normalized scope is bound
-into every approval. The `env` array grants inherited variable names only for this
-call, not arbitrary values. It adds selected names to the safe baseline; it does
+resource retains its requested spelling alongside its canonical identity. For a
+symlink alias, both spellings independently pass the permission system's ordinary
+path gates, the complete alias/target scope is bound into every approval, and the
+approved target is mounted at the requested spelling without unmasking its parent
+or siblings. Both spelling and target are revalidated after approval. Absolute
+resource paths containing `..` are rejected rather than interpreted through
+symlink-sensitive parent traversal. The `env` array grants inherited variable
+names only for this call, not arbitrary values. It adds selected names to the safe baseline; it does
 not expose variables whose values are unset. Once approved, selected values are
 visible to Bash and descendants and may be printed or exfiltrated by the command.
 

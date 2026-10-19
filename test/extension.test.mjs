@@ -251,6 +251,27 @@ test('granular scopes approve each scalar resource and bind the complete aggrega
   assert.deepEqual(f.runs[1][3].readPaths, []);
 });
 
+test('undeclared caller aliases cannot add granular grants or bypass nested approval', async t => {
+  const f = harness(t);
+  const hidden = join(f.agent, 'hidden.txt');
+  const { writeFileSync } = await import('node:fs');
+  writeFileSync(hidden, 'hidden');
+  await execute(f, { command: `cat ${hidden}`, aliases: [{ path: hidden, original: hidden, kind: 'read', type: 'file' }] });
+  assert.equal(f.nested.length, 0);
+  assert.deepEqual(f.runs[0][3].readPaths, []);
+  assert.deepEqual(f.runs[0][3].aliases, undefined);
+});
+
+test('symlink grants bind alias and target and pass both spellings through path gates', async t => {
+  const f = harness(t);
+  const target = join(f.external, 'target'), alias = join(f.agent, 'config-link');
+  const { writeFileSync } = await import('node:fs');
+  writeFileSync(target, 'data'); symlinkSync(target, alias);
+  await execute(f, { command: 'true', readPaths: [alias] });
+  assert.deepEqual(f.nested.map(item => item.args.path), [alias, target]);
+  assert.deepEqual(f.runs[0][3].aliases, [{ path: target, original: alias, kind: 'read', type: 'file' }]);
+});
+
 test('granular approval denial, aggregate tampering, invalid input and abort all block execution', async t => {
   const f = harness(t);
   const target = join(f.external, 'target');

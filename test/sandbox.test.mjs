@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
-import { checkWriteRoot, executable, loadConfig } from '../src/config.mjs';
+import { checkWriteRoot, executable, loadConfig, normalizeScopes } from '../src/config.mjs';
 import { plan, planHost, runSandbox, spawnSandbox } from '../src/sandbox.mjs';
 import { fixture } from './helpers.mjs';
 
@@ -36,6 +36,15 @@ test('profile rejects a resource type changed after approval', t => {
   const scope = { readPaths: [target], resourceTypes: [{ path: target, kind: 'read', type: 'file' }] };
   rmSync(target); mkdirSync(target);
   assert.throws(() => plan(f.config, f.workspace, 'true', scope, f.scratch), /types changed/);
+});
+
+test('launch planning rejects an alias retargeted after authorization', t => {
+  const f = fixture(t);
+  const target = join(f.external, 'target'), replacement = join(f.external, 'replacement'), alias = join(f.agent, 'link');
+  writeFileSync(target, 'approved'); writeFileSync(replacement, 'changed'); symlinkSync(target, alias);
+  const scope = normalizeScopes({ readPaths: [alias] }, f.config);
+  unlinkSync(alias); symlinkSync(replacement, alias);
+  assert.throws(() => plan(f.config, f.workspace, 'true', scope, f.scratch), /aliases changed|did not match/);
 });
 
 test('read-only profile never grants baseline write roots', t => {

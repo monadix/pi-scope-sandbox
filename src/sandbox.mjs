@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { lstat, mkdtemp, mkdir, rm } from 'node:fs/promises';
 import { realpathSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { checkWriteRoot, contains, directory, hostEnvironment, normalizeScopes, protectedWritePaths, safeEnvironment } from './config.mjs';
 
 function validateResourceTypes(scope, granular) {
@@ -10,6 +10,7 @@ function validateResourceTypes(scope, granular) {
   const expected = [...granular.resourceTypes, ...(scope.path ? [{ path: scope.path, kind: 'writeRoot', type: 'directory' }] : [])]
     .sort((a, b) => `${a.kind}:${a.path}`.localeCompare(`${b.kind}:${b.path}`));
   if (JSON.stringify(scope.resourceTypes) !== JSON.stringify(expected)) throw new Error('Scoped resource types changed after approval');
+  if (JSON.stringify(scope.aliases ?? []) !== JSON.stringify(granular.aliases ?? [])) throw new Error('Scoped resource aliases changed after approval');
 }
 
 function checkExecutable(path, identity, label) {
@@ -68,8 +69,26 @@ export function plan(config, cwd, command, scope = {}, temp) {
     }
   }
   for (const [path, kind] of grants) args.push(kind === 'write' ? '--bind' : '--ro-bind', path, path);
-  for (const path of protectedWritePaths([cwd, ...roots, ...granularDirectories], config)) {
-    if (!config.denyRead.some(root => contains(root, path))) args.push('--ro-bind', path, path);
+  for (const alias of granular.aliases ?? []) {
+    const ancestor = config.denyRead.filter(root => contains(root, alias.original) && root !== alias.original).sort((a, b) => b.length - a.length)[0];
+    if (ancestor) {
+      const pieces = alias.original.slice(ancestor.length).split('/').filter(Boolean);
+      let parent = ancestor;
+      for (const piece of pieces.slice(0, -1)) { parent = join(parent, piece); args.push('--dir', parent); }
+    }
+    if (alias.type === 'directory') args.push('--dir', alias.original);
+    if (alias.kind === 'socket') args.push('--file', '0', alias.original);
+    args.push(alias.kind === 'write' ? '--bind' : '--ro-bind', alias.path, alias.original);
+  }
+  const protectedMounts = protectedWritePaths([cwd, ...roots, ...granularDirectories], config).map(path => [path, path]);
+  for (const alias of granular.aliases ?? []) {
+    if (alias.kind !== 'write' || alias.type !== 'directory') continue;
+    for (const path of protectedWritePaths([alias.path], config)) {
+      if (contains(alias.path, path)) protectedMounts.push([path, join(alias.original, relative(alias.path, path))]);
+    }
+  }
+  for (const [source, destination] of protectedMounts) {
+    if (!config.denyRead.some(root => contains(root, source))) args.push('--ro-bind', source, destination);
   }
   for (const path of maskedDirectories) args.push('--remount-ro', path);
   args.push('--chdir', cwd, '--', config.shell, '--noprofile', '--norc', '-c', command);

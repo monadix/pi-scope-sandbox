@@ -203,6 +203,37 @@ if (process.env.PI_SCOPE_NATIVE === '1') {
     assert.equal(readFileSync(ordinary, 'utf8'), 'ordinary');
   });
 
+  test('real Bubblewrap: writable directory aliases retain .pi, Git, parent and sibling protections', async t => {
+    const f = fixture(t, {}, process.cwd());
+    const checkout = join(f.external, 'aliased-checkout');
+    const aliasParent = join(f.agent, 'masked-parent');
+    const alias = join(aliasParent, 'checkout-link');
+    mkdirSync(join(checkout, '.git', 'hooks'), { recursive: true });
+    mkdirSync(join(checkout, '.pi'), { recursive: true });
+    mkdirSync(aliasParent);
+    writeFileSync(join(checkout, '.git', 'config'), 'git-config');
+    writeFileSync(join(checkout, '.git', 'hooks', 'pre-commit'), 'git-hook');
+    writeFileSync(join(checkout, '.pi', 'policy'), 'pi-policy');
+    writeFileSync(join(checkout, 'before'), 'before');
+    writeFileSync(join(f.external, 'checkout-sibling'), 'sibling');
+    symlinkSync(checkout, alias);
+    f.config = loadConfig(f.agent, f.home, f.extension, {});
+    const result = await capture(f,
+      `printf updated > ${quote(join(alias, 'before'))} && ` +
+      `! printf BAD > ${quote(join(alias, '.pi', 'policy'))} && ` +
+      `! printf BAD > ${quote(join(alias, '.git', 'config'))} && ` +
+      `! printf BAD > ${quote(join(alias, '.git', 'hooks', 'pre-commit'))} && ` +
+      `! printf BAD > ${quote(join(aliasParent, 'parent-write'))} && ` +
+      `! printf BAD > ${quote(join(f.external, 'checkout-sibling'))}`,
+      { writePaths: [alias] });
+    assert.equal(result.exitCode, 0, result.output);
+    assert.equal(readFileSync(join(checkout, 'before'), 'utf8'), 'updated');
+    assert.equal(readFileSync(join(checkout, '.pi', 'policy'), 'utf8'), 'pi-policy');
+    assert.equal(readFileSync(join(checkout, '.git', 'config'), 'utf8'), 'git-config');
+    assert.equal(readFileSync(join(checkout, '.git', 'hooks', 'pre-commit'), 'utf8'), 'git-hook');
+    assert.equal(readFileSync(join(f.external, 'checkout-sibling'), 'utf8'), 'sibling');
+  });
+
   test('real Bubblewrap: single-file writes reject symlinked .git and .pi metadata ancestry', async t => {
     const f = fixture(t, {}, process.cwd());
     const checkout = join(f.external, 'symlinked-checkout');
@@ -255,6 +286,52 @@ if (process.env.PI_SCOPE_NATIVE === '1') {
     assert.equal(readFileSync(join(f.external, '.git', 'config'), 'utf8'), 'git-config');
     assert.equal(readFileSync(join(f.external, '.git', 'hooks', 'pre-commit'), 'utf8'), 'hook');
     assert.equal(readFileSync(join(f.external, '.pi', 'policy'), 'utf8'), 'policy');
+  });
+
+  test('real Bubblewrap: approved symlink alias beneath a masked agent directory stays exact and read-only', async t => {
+    const f = fixture(t, {}, process.cwd());
+    const targetDir = join(f.external, 'store');
+    mkdirSync(targetDir);
+    const target = join(targetDir, 'config.json');
+    const sibling = join(targetDir, 'sibling.json');
+    writeFileSync(target, '{"ok":true}');
+    writeFileSync(sibling, 'hidden');
+    const alias = join(f.agent, 'extensions', 'mock', 'config.json');
+    mkdirSync(join(f.agent, 'extensions', 'mock'), { recursive: true });
+    symlinkSync(target, alias);
+    f.config = loadConfig(f.agent, f.home, f.extension, {});
+    const command = `test "$(cat ${quote(alias)})" = '{"ok":true}' && test ! -e ${quote(join(f.agent, 'extensions', 'mock', 'sibling.json'))} && ! printf BAD > ${quote(alias)}`;
+    const result = await capture(f, command, { readPaths: [alias] });
+    assert.equal(result.exitCode, 0, result.output);
+    assert.equal(readFileSync(target, 'utf8'), '{"ok":true}');
+    assert.notEqual((await capture(f, `cat ${quote(alias)}`)).exitCode, 0, 'grant must not persist');
+    assert.equal(readFileSync(sibling, 'utf8'), 'hidden');
+  });
+
+  test('real Bubblewrap: directory and Unix-socket aliases below masked parents retain exact bounds', async t => {
+    const f = fixture(t, {}, process.cwd());
+    const dataDir = join(f.external, 'directory');
+    mkdirSync(dataDir);
+    writeFileSync(join(dataDir, 'allowed'), 'yes');
+    writeFileSync(join(dataDir, 'sibling'), 'no');
+    const aliasParent = join(f.agent, 'parent-link');
+    mkdirSync(aliasParent);
+    symlinkSync(dataDir, join(aliasParent, 'directory-alias'));
+    const directoryAlias = join(aliasParent, 'directory-alias');
+    const socketTarget = join(f.external, 'service.sock');
+    const socketAlias = join(f.agent, 'service-link.sock');
+    const server = createServer(socket => socket.end());
+    await new Promise(resolve => server.listen(socketTarget, resolve));
+    symlinkSync(socketTarget, socketAlias);
+    t.after(() => new Promise(resolve => server.close(resolve)));
+    f.config = loadConfig(f.agent, f.home, f.extension, {});
+    let result = await capture(f, `test "$(cat ${quote(join(directoryAlias, 'allowed'))})" = yes && test "$(cat ${quote(join(directoryAlias, 'sibling'))})" = no && test ! -e ${quote(join(aliasParent, 'sibling'))}`, { readPaths: [directoryAlias] });
+    assert.equal(result.exitCode, 0, result.output);
+    const script = `const c=require('node:net').connect(${JSON.stringify(socketAlias)});c.on('error',e=>{process.stdout.write(e.code);process.exit(11)});c.on('connect',()=>{process.stdout.write('connected');c.end();});`;
+    result = await capture(f, `${quote(process.execPath)} -e ${quote(script)}`, { unixSockets: [socketAlias] });
+    assert.equal(result.exitCode, 0, `socket alias failed: ${JSON.stringify(result)}`);
+    assert.match(result.output, /connected/);
+    await assert.rejects(runSandbox(f.config, f.workspace, 'true', { readPaths: [`${aliasParent}/../parent-link/directory-alias`] }), /parent traversal/);
   });
 
   test('real Bubblewrap: one masked Unix socket and selected variable do not expose neighbors or network', async t => {

@@ -62,9 +62,9 @@ export function registerSandbox(pi, { Type, createBashTool, getAgentDir, getPerm
     description: 'Request exactly one scope exception for the specified command. This does not run a command or grant future calls. Each scalar path identifies one exact read, write, writable-root or Unix-socket resource and also passes through permission path gates; scope binds the complete aggregate. network=true enables host networking. host=true instead requests UNSANDBOXED execution as the Pi user, with host filesystem, networking, Unix sockets and environment (including credentials) accessible. Host mode requires trusted allowHost=true. Authorization belongs to pi-permission-system.',
     parameters: Type.Object({
       command: Type.String(),
-      path: Type.Optional(Type.String({ description: 'One canonical filesystem resource passed through path and external-directory gates' })),
-      resourceKind: Type.Optional(Type.String()), resourceName: Type.Optional(Type.String()), resourceType: Type.Optional(Type.String()),
-      scope: Type.Optional(Type.Object({ path: Type.Optional(Type.String()), network: Type.Boolean(), host: Type.Optional(Type.Boolean()), readPaths: Type.Array(Type.String()), writePaths: Type.Array(Type.String()), unixSockets: Type.Array(Type.String()), env: Type.Array(Type.String()), resourceTypes: Type.Array(Type.Object({ path: Type.String(), kind: Type.String(), type: Type.String() })) })),
+      path: Type.Optional(Type.String({ description: 'One requested filesystem resource spelling passed through path and external-directory gates' })),
+      resourceKind: Type.Optional(Type.String()), resourceName: Type.Optional(Type.String()), resourceType: Type.Optional(Type.String()), requestedPath: Type.Optional(Type.String()),
+      scope: Type.Optional(Type.Object({ path: Type.Optional(Type.String()), network: Type.Boolean(), host: Type.Optional(Type.Boolean()), readPaths: Type.Array(Type.String()), writePaths: Type.Array(Type.String()), unixSockets: Type.Array(Type.String()), env: Type.Array(Type.String()), resourceTypes: Type.Array(Type.Object({ path: Type.String(), kind: Type.String(), type: Type.String() })), aliases: Type.Optional(Type.Array(Type.Object({ path: Type.String(), original: Type.String(), kind: Type.String(), type: Type.String() }))) })),
       network: Type.Boolean(),
       host: Type.Optional(Type.Boolean({ description: 'UNSANDBOXED execution with the Pi user\'s host permissions and environment, including credentials' })),
     }),
@@ -79,12 +79,13 @@ export function registerSandbox(pi, { Type, createBashTool, getAgentDir, getPerm
       const resourceKind = params.resourceKind ?? 'writeRoot';
       if (!['writeRoot', 'read', 'write', 'socket', 'network', 'env', 'host'].includes(resourceKind)) throw new Error('Invalid scope resource kind');
       const path = params.path === undefined ? undefined : resourceKind === 'writeRoot' ? checkWriteRoot(params.path, config) : resourcePath(params.path, config, resourceKind === 'read' ? 'read' : resourceKind === 'write' ? 'write' : 'socket');
+      if (params.requestedPath !== undefined && (params.requestedPath !== params.path || resourcePath(params.requestedPath, config, resourceKind) !== path)) throw new Error('Scoped resource spelling changed or did not match');
       const actualType = path ? resourceKind === 'writeRoot' ? 'directory' : resourceType(path) : undefined;
       if (params.resourceType !== undefined && params.resourceType !== actualType) throw new Error('Scoped resource type changed or did not match');
       const scope = params.scope;
       if (!host && !path && !params.resourceName && params.network !== true) throw new Error('No additional scope requested');
       return text('Scope request passed permission gates; no command was executed.', {
-        command: params.command, cwd, path, resourceKind: params.resourceKind, resourceName: params.resourceName, resourceType: params.resourceType, scope,
+        command: params.command, cwd, path, requestedPath: params.requestedPath, resourceKind: params.resourceKind, resourceName: params.resourceName, resourceType: params.resourceType, scope,
         network: host || params.network === true, ...(host ? { host: true } : {}),
       });
     },
@@ -118,7 +119,7 @@ export function registerSandbox(pi, { Type, createBashTool, getAgentDir, getPerm
       const host = params.host === true || hostDefault;
       if (host && !config.allowHost) throw new Error('Host escalation is disabled by trusted global configuration');
       const path = params.writeRoot === undefined ? undefined : checkWriteRoot(params.writeRoot, config);
-      const granular = normalizeScopes(params, config);
+      const granular = normalizeScopes({ readPaths: params.readPaths, writePaths: params.writePaths, unixSockets: params.unixSockets, env: params.env }, config);
       if (host && (path !== undefined || params.network === true || granular.readPaths.length || granular.writePaths.length || granular.unixSockets.length || granular.env.length)) throw new Error('Host escalation cannot be combined with narrower scopes');
       const network = host || (params.network === true && !config.network);
       const resourceTypes = [...granular.resourceTypes, ...(path ? [{ path, kind: 'writeRoot', type: 'directory' }] : [])].sort((a, b) => `${a.kind}:${a.path}`.localeCompare(`${b.kind}:${b.path}`));
@@ -131,15 +132,18 @@ export function registerSandbox(pi, { Type, createBashTool, getAgentDir, getPerm
         if (typeof ctx.executeTool !== 'function') throw new Error('Pi nested tool execution is required for scope requests');
         // Each path-bearing request reaches the permission system's scalar path extractor.
         for (const [resource, resourceKind, resourceName, originals = [], type] of resources) {
-          if (signal?.aborted) throw new Error('Sandbox command aborted');
-          const gate = host ? HOST_GRANT_TOOL : GRANT_TOOL;
-          const request = { command, ...(resource ? { path: resource } : {}), resourceKind, ...(resourceName ? { resourceName } : {}), ...(type ? { resourceType: type } : {}), ...(!host ? { scope, network } : { network: true, host: true }) };
-          const result = await ctx.executeTool(gate, request, { signal });
-          const approved = result?.result?.details;
-          if (result?.isError || !approved || approved.command !== command || approved.cwd !== cwd || approved.path !== resource || approved.resourceKind !== resourceKind || approved.resourceName !== resourceName || approved.resourceType !== type || JSON.stringify(approved.scope) !== JSON.stringify(host ? undefined : scope) || approved.network !== (host ? true : network) || approved.host !== (host ? true : undefined)) throw new Error('Sandbox scope was not approved for this exact command and aggregate scope');
-          for (const original of originals) {
-            const current = resourceKind === 'writeRoot' ? checkWriteRoot(original, config) : resourcePath(original, config, resourceKind === 'read' ? 'read' : resourceKind === 'write' ? 'write' : 'socket');
-            if (current !== resource || resourceType(original) !== type) throw new Error('Requested resource changed during authorization');
+          const spellings = resource ? [...new Set([...originals, resource])] : [undefined];
+          for (const requestedPath of spellings) {
+            if (signal?.aborted) throw new Error('Sandbox command aborted');
+            const gate = host ? HOST_GRANT_TOOL : GRANT_TOOL;
+            const request = { command, ...(resource ? { path: requestedPath, ...(resourceKind !== 'writeRoot' ? { requestedPath } : {}) } : {}), resourceKind, ...(resourceName ? { resourceName } : {}), ...(type ? { resourceType: type } : {}), ...(!host ? { scope, network } : { network: true, host: true }) };
+            const result = await ctx.executeTool(gate, request, { signal });
+            const approved = result?.result?.details;
+            if (result?.isError || !approved || approved.command !== command || approved.cwd !== cwd || approved.path !== resource || approved.requestedPath !== (resourceKind === 'writeRoot' ? undefined : requestedPath) || approved.resourceKind !== resourceKind || approved.resourceName !== resourceName || approved.resourceType !== type || JSON.stringify(approved.scope) !== JSON.stringify(host ? undefined : scope) || approved.network !== (host ? true : network) || approved.host !== (host ? true : undefined)) throw new Error('Sandbox scope was not approved for this exact command and aggregate scope');
+            for (const original of originals) {
+              const current = resourceKind === 'writeRoot' ? checkWriteRoot(original, config) : resourcePath(original, config, resourceKind === 'read' ? 'read' : resourceKind === 'write' ? 'write' : 'socket');
+              if (current !== resource || resourceType(original) !== type) throw new Error('Requested resource changed during authorization');
+            }
           }
         }
         if (signal?.aborted) throw new Error('Sandbox command aborted');

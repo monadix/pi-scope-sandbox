@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
 import { checkWriteRoot, contains, loadConfig, normalizeScopes, protectedWritePaths, safeEnvironment, hostEnvironment } from '../src/config.mjs';
@@ -103,6 +103,38 @@ test('per-call scope normalization validates existing resources, denyRead and en
   const denied = fixture(t, { denyRead: [file] });
   assert.throws(() => normalizeScopes({ readPaths: [file] }, denied.config), /denyRead/);
   assert.throws(() => normalizeScopes({ writePaths: [file] }, denied.config), /denyRead/);
+});
+
+test('listed aliases cannot add an unapproved resource', t => {
+  const f = fixture(t);
+  const target = join(f.external, 'target'), alias = join(f.workspace, 'resource-link');
+  writeFileSync(target, 'mock'); symlinkSync(target, alias);
+  const forged = { path: target, original: alias, kind: 'read', type: 'file' };
+  assert.throws(() => normalizeScopes({ aliases: [forged] }, f.config), /aliases changed or did not match/);
+  assert.throws(() => normalizeScopes({ readPaths: [target], aliases: [{ ...forged, path: join(f.scratch, 'other') }] }, f.config), /aliases changed or did not match/);
+});
+
+test('operator denyRead rejects symlink aliases through normalized lexical paths', t => {
+  const f = fixture(t);
+  const target = join(f.external, 'target'), privateDirectory = join(f.external, 'private');
+  mkdirSync(privateDirectory);
+  const alias = join(privateDirectory, 'resource-link');
+  writeFileSync(target, 'mock'); symlinkSync(target, alias);
+  for (const denied of [alias, target, privateDirectory]) {
+    const config = loadConfig(f.agent, f.home, f.extension, { denyRead: [denied] });
+    assert.throws(() => normalizeScopes({ readPaths: [alias] }, config), /denyRead/);
+  }
+  const directoryConfig = loadConfig(f.agent, f.home, f.extension, { denyRead: [privateDirectory] });
+  assert.throws(() => normalizeScopes({ readPaths: [`${privateDirectory}/./resource-link`] }, directoryConfig), /denyRead/);
+});
+
+test('granular alias destinations cannot overlap private /proc or /dev mounts', t => {
+  const f = fixture(t);
+  const privateAliasDirectory = mkdtempSync('/dev/shm/.scope-alias-test-');
+  t.after(() => rmSync(privateAliasDirectory, { recursive: true, force: true }));
+  const target = join(f.external, 'target'), alias = join(privateAliasDirectory, 'resource-link');
+  writeFileSync(target, 'mock'); symlinkSync(target, alias);
+  assert.throws(() => normalizeScopes({ readPaths: [`${privateAliasDirectory}/./resource-link`] }, f.config), /private virtual filesystem mounts/);
 });
 
 test('shell/loader/provider credentials are not inherited', t => {

@@ -69,7 +69,7 @@ export function loadConfig(agentDir, home, sourceDir, override) {
   ].filter(p => existsSync(p)).map(p => realpathSync(p)))];
   const config = {
     mode: raw.mode ?? 'workspace-write', network: raw.network ?? false, allowHost: raw.allowHost ?? false,
-    writeRoots: (raw.writeRoots ?? []).map(directory), denyRead, operatorDenyRead: (raw.denyRead ?? []).map(p => realpathSync(p)), protectedRoots,
+    writeRoots: (raw.writeRoots ?? []).map(directory), denyRead, operatorDenyRead: (raw.denyRead ?? []).flatMap(p => [resolve(p), realpathSync(p)]), protectedRoots,
     envAllow, home: realpathSync(home), bwrap, shell, bwrapIdentity, shellIdentity,
     childExtensions: (raw.childExtensions ?? []).map(path => {
       if (!isAbsolute(path) || !statSync(path).isFile()) throw new Error('childExtensions must name existing absolute module files');
@@ -81,15 +81,16 @@ export function loadConfig(agentDir, home, sourceDir, override) {
 }
 
 export function resourcePath(path, config, kind) {
-  if (typeof path !== 'string' || !isAbsolute(path) || !existsSync(path)) throw new Error('Scoped resources must be existing absolute paths');
+  if (typeof path !== 'string' || !isAbsolute(path) || path.split(sep).includes('..') || !existsSync(path)) throw new Error('Scoped resources must be existing absolute paths without parent traversal');
+  const lexical = resolve(path);
   const canonical = realpathSync(path);
-  if (['/tmp', '/var/tmp'].some(root => contains(canonical, root))) throw new Error('Scoped resource overlaps reserved private scratch mounts');
-  if (['/proc', '/dev'].some(root => contains(root, canonical) || contains(canonical, root))) throw new Error('Scoped resource overlaps private virtual filesystem mounts');
+  if (['/tmp', '/var/tmp'].some(root => contains(lexical, root) || contains(canonical, root))) throw new Error('Scoped resource overlaps reserved private scratch mounts');
+  if (['/proc', '/dev'].some(root => contains(root, lexical) || contains(lexical, root) || contains(root, canonical) || contains(canonical, root))) throw new Error('Scoped resource overlaps private virtual filesystem mounts');
   const stat = statSync(canonical);
   if (kind === 'read' && !(stat.isFile() || stat.isDirectory())) throw new Error('Read scopes must name existing files or directories');
   if (kind === 'write' && !(stat.isFile() || stat.isDirectory())) throw new Error('Write scopes must name existing files or directories');
   if (kind === 'socket' && !stat.isSocket()) throw new Error('Unix socket scopes must name existing AF_UNIX sockets');
-  if (config.operatorDenyRead.some(root => contains(root, canonical) || contains(canonical, root))) throw new Error('Operator denyRead blocks granular access');
+  if (config.operatorDenyRead.some(root => contains(root, lexical) || contains(lexical, root) || contains(root, canonical) || contains(canonical, root))) throw new Error('Operator denyRead blocks granular access');
   if (kind === 'read' && stat.isDirectory() && config.denyRead.some(root => root !== canonical && contains(canonical, root))) throw new Error('Read directory would contain masked descendants');
   if (kind === 'write') {
     if (config.protectedRoots.some(root => contains(root, canonical) || contains(canonical, root))) throw new Error('Scoped resource overlaps a protected path');
@@ -109,10 +110,15 @@ export function resourceType(path) {
 
 export function normalizeScopes(input, config) {
   const resourceTypes = [];
+  const aliases = [];
   const list = (key, kind) => {
     const values = input[key] ?? [];
     if (!Array.isArray(values)) throw new Error(`${key} must be an array`);
-    const paths = [...new Set(values.map(path => resourcePath(path, config, kind)))].sort();
+    const paths = [...new Set(values.map(original => {
+      const path = resourcePath(original, config, kind);
+      if (original !== path) aliases.push({ path, original, kind, type: resourceType(path) });
+      return path;
+    }))].sort();
     for (const path of paths) resourceTypes.push({ path, kind, type: resourceType(path) });
     return paths;
   };
@@ -120,7 +126,11 @@ export function normalizeScopes(input, config) {
   if (!Array.isArray(env) || env.some(name => typeof name !== 'string' || !ENV_NAME.test(name) || EXECUTION_ENV.test(name) || RESERVED_ENV.test(name))) {
     throw new Error('env contains an invalid or execution-control variable name');
   }
-  return { readPaths: list('readPaths', 'read'), writePaths: list('writePaths', 'write'), unixSockets: list('unixSockets', 'socket'), env: [...new Set(env)].sort(), resourceTypes: resourceTypes.sort((a, b) => `${a.kind}:${a.path}`.localeCompare(`${b.kind}:${b.path}`)) };
+  const readPaths = list('readPaths', 'read'), writePaths = list('writePaths', 'write'), unixSockets = list('unixSockets', 'socket');
+  const listedAliases = input.aliases ?? [];
+  if (!Array.isArray(listedAliases) || listedAliases.some(alias => !alias || !['read', 'write', 'socket'].includes(alias.kind) || typeof alias.path !== 'string' || typeof alias.original !== 'string' || !isAbsolute(alias.original) || alias.original.split(sep).includes('..') || resourcePath(alias.original, config, alias.kind) !== alias.path || resourceType(alias.original) !== alias.type || !(alias.kind === 'read' ? readPaths : alias.kind === 'write' ? writePaths : unixSockets).includes(alias.path))) throw new Error('Scoped resource aliases changed or did not match');
+  const mergedAliases = [...new Map([...aliases, ...listedAliases].map(alias => [`${alias.kind}:${alias.original}`, alias])).values()].sort((a, b) => `${a.kind}:${a.original}`.localeCompare(`${b.kind}:${b.original}`));
+  return { readPaths, writePaths, unixSockets, env: [...new Set(env)].sort(), resourceTypes: resourceTypes.sort((a, b) => `${a.kind}:${a.path}`.localeCompare(`${b.kind}:${b.path}`)), ...(mergedAliases.length ? { aliases: mergedAliases } : {}) };
 }
 
 export function checkWriteRoot(path, config) {
