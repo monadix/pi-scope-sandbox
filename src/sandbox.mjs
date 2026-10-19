@@ -3,9 +3,31 @@ import { lstat, mkdtemp, mkdir, rm } from 'node:fs/promises';
 import { realpathSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { checkWriteRoot, contains, directory, protectedWritePaths, safeEnvironment } from './config.mjs';
+import { checkWriteRoot, contains, directory, hostEnvironment, normalizeScopes, protectedWritePaths, safeEnvironment } from './config.mjs';
+
+function validateResourceTypes(scope, granular) {
+  if (scope.resourceTypes === undefined) return;
+  const expected = [...granular.resourceTypes, ...(scope.path ? [{ path: scope.path, kind: 'writeRoot', type: 'directory' }] : [])]
+    .sort((a, b) => `${a.kind}:${a.path}`.localeCompare(`${b.kind}:${b.path}`));
+  if (JSON.stringify(scope.resourceTypes) !== JSON.stringify(expected)) throw new Error('Scoped resource types changed after approval');
+}
+
+function checkExecutable(path, identity, label) {
+  try {
+    const current = statSync(path);
+    if (!identity || realpathSync(path) !== path || Object.entries(identity).some(([key, value]) => current[key] !== value)) throw new Error('identity changed');
+  } catch { throw new Error(`Pinned ${label} changed or is unavailable`); }
+}
+
+export function planHost(config, cwd, command) {
+  if (!config.allowHost) throw new Error('Host escalation is disabled by trusted global configuration');
+  if (typeof command !== 'string' || !command.trim() || command.length > 16384 || command.includes('\0')) throw new Error('Invalid or oversized sandbox command');
+  checkExecutable(config.shell, config.shellIdentity, 'host shell');
+  return { file: config.shell, args: ['--noprofile', '--norc', '-c', command], env: hostEnvironment(), cwd: directory(cwd) };
+}
 
 export function plan(config, cwd, command, scope = {}, temp) {
+  if (scope.host) throw new Error('Host execution must not use a sandbox profile');
   if (process.platform !== 'linux') throw new Error('pi-scope-sandbox currently supports Linux only');
   if (typeof command !== 'string' || !command.trim() || command.length > 16384 || command.includes('\0')) throw new Error('Invalid or oversized sandbox command');
   cwd = directory(cwd);
@@ -16,6 +38,9 @@ export function plan(config, cwd, command, scope = {}, temp) {
   }
   const roots = config.mode === 'workspace-write' ? [checkWriteRoot(cwd, config), ...config.writeRoots] : [];
   if (scope.path) roots.push(checkWriteRoot(scope.path, config));
+  const granular = normalizeScopes(scope, config);
+  validateResourceTypes(scope, granular);
+  const granularDirectories = granular.writePaths.filter(path => statSync(path).isDirectory()).map(path => checkWriteRoot(path, config));
   const network = config.network || scope.network === true;
   const args = [
     '--die-with-parent', '--unshare-all', '--new-session', '--cap-drop', 'ALL',
@@ -26,17 +51,31 @@ export function plan(config, cwd, command, scope = {}, temp) {
   // A private /tmp hides a workspace below host /tmp; mount it back explicitly.
   args.push('--ro-bind', cwd, cwd);
   for (const root of [...new Set(roots)]) args.push('--bind', root, root);
-  for (const path of protectedWritePaths([cwd, ...roots], config)) args.push('--ro-bind', path, path);
+  const maskedDirectories = [];
   for (const path of config.denyRead) {
-    if (statSync(path).isDirectory()) args.push('--tmpfs', path, '--remount-ro', path);
+    if (statSync(path).isDirectory()) { args.push('--tmpfs', path); maskedDirectories.push(path); }
     else args.push('--ro-bind', '/dev/null', path);
   }
+  // Re-create only the empty parent chain beneath a masked ancestor; exact
+  // resource binds below never expose masked siblings or grant parent writes.
+  const grants = [...granular.readPaths.map(path => [path, 'read']), ...granular.writePaths.map(path => [path, 'write']), ...granular.unixSockets.map(path => [path, 'socket'])];
+  for (const [path] of grants) {
+    const ancestor = config.denyRead.filter(root => contains(root, path) && root !== path).sort((a, b) => b.length - a.length)[0];
+    if (ancestor) {
+      const pieces = path.slice(ancestor.length).split('/').filter(Boolean);
+      let parent = ancestor;
+      for (const piece of pieces.slice(0, -1)) { parent = join(parent, piece); args.push('--dir', parent); }
+    }
+  }
+  for (const [path, kind] of grants) args.push(kind === 'write' ? '--bind' : '--ro-bind', path, path);
+  for (const path of protectedWritePaths([cwd, ...roots, ...granularDirectories], config)) {
+    if (!config.denyRead.some(root => contains(root, path))) args.push('--ro-bind', path, path);
+  }
+  for (const path of maskedDirectories) args.push('--remount-ro', path);
   args.push('--chdir', cwd, '--', config.shell, '--noprofile', '--norc', '-c', command);
-  try {
-    const current = statSync(config.bwrap);
-    if (realpathSync(config.bwrap) !== config.bwrap || Object.entries(config.bwrapIdentity).some(([key, value]) => current[key] !== value)) throw new Error('identity changed');
-  } catch { throw new Error('Pinned sandbox backend changed or is unavailable'); }
-  return { file: config.bwrap, args, env: safeEnvironment(config), cwd };
+  checkExecutable(config.bwrap, config.bwrapIdentity, 'sandbox backend');
+  checkExecutable(config.shell, config.shellIdentity, 'host shell');
+  return { file: config.bwrap, args, env: safeEnvironment(config, process.env, granular.env), cwd };
 }
 
 export function spawnSandbox(invocation, { signal, timeout, onData = () => {} } = {}) {
@@ -75,12 +114,19 @@ export function spawnSandbox(invocation, { signal, timeout, onData = () => {} } 
 
 export async function runSandbox(config, cwd, command, scope = {}, options = {}) {
   if (options.signal?.aborted) throw new Error('Sandbox command aborted');
+  if (scope.host === true) {
+    if (scope.path !== undefined) throw new Error('Host escalation cannot be combined with a write-root scope');
+    return spawnSandbox(planHost(config, cwd, command), options);
+  }
   // Mounting a missing path below a writable bind needs a host mountpoint.
   // Keep this empty directory between calls: deleting it would race a sibling
   // sandbox. Never follow a project .pi symlink into an unprotected alias.
+  const granular = normalizeScopes(scope, config);
+  validateResourceTypes(scope, granular);
   const roots = [
     ...(config.mode === 'workspace-write' ? [cwd, ...config.writeRoots] : []),
     ...(scope.path ? [scope.path] : []),
+    ...granular.writePaths.filter(path => statSync(path).isDirectory()),
   ].map(path => checkWriteRoot(path, config));
   for (const root of new Set(roots)) {
     const metadata = join(root, '.pi');

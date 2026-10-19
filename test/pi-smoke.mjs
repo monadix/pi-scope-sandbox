@@ -20,8 +20,10 @@ let session;
 try {
   writeFileSync(join(agentDir, 'extensions/pi-permission-system/config.json'), JSON.stringify({
     authorizerChain: ['scope-offline-test'],
-    permission: { '*': 'deny', bash: 'allow', scope_sandbox_authorize: 'ask', path: 'allow', external_directory: 'allow' },
+    permission: { '*': 'deny', bash: 'allow', scope_sandbox_authorize: 'ask', scope_host_authorize: 'ask', path: 'allow', external_directory: 'allow' },
   }));
+  mkdirSync(join(agentDir, 'extensions/pi-scope-sandbox'), { recursive: true });
+  writeFileSync(join(agentDir, 'extensions/pi-scope-sandbox/config.json'), JSON.stringify({ allowHost: true }));
   const jiti = createJiti(import.meta.url);
   const permissionsUrl = import.meta.resolve('@gotgenes/pi-permission-system');
   const { getPermissionsService } = await jiti.import(permissionsUrl);
@@ -50,7 +52,7 @@ try {
   const model = runtime.getModels()[0];
   assert.ok(model, 'static model metadata available');
   await runtime.setRuntimeApiKey(model.provider, 'offline-test-not-a-credential');
-  ({ session } = await createAgentSession({ cwd: workspace, agentDir, modelRuntime: runtime, model, thinkingLevel: 'off', settingsManager, resourceLoader: loader, sessionManager: SessionManager.inMemory(workspace), tools: ['bash', 'scope_sandbox_authorize'] }));
+  ({ session } = await createAgentSession({ cwd: workspace, agentDir, modelRuntime: runtime, model, thinkingLevel: 'off', settingsManager, resourceLoader: loader, sessionManager: SessionManager.inMemory(workspace), tools: ['bash', 'scope_sandbox_authorize', 'scope_host_authorize'] }));
   const errors = [];
   await session.bindExtensions({ mode: 'json', onError: error => errors.push(error) });
   const { registerRequiredChildExtensions } = await jiti.import(import.meta.resolve('pi-subagents/required-child-extensions'));
@@ -100,8 +102,35 @@ try {
   result = await invoke({ command: `printf denied > ${quote(denied)}`, writeRoot: external });
   assert.equal(result.isError, true);
   assert.equal(existsSync(denied), false);
+  const deniedHost = join(workspace, 'denied-host');
+  result = await invoke({ command: `printf denied > ${quote(deniedHost)}`, host: true });
+  assert.equal(result.isError, true);
+  assert.equal(existsSync(deniedHost), false);
+
+  allow = true;
+  const hidden = join(agentDir, 'mock-host-resource');
+  writeFileSync(hidden, 'mock-only-host-resource');
+  const command = `cat ${quote(hidden)}`;
+  result = await invoke({ command });
+  assert.equal(result.isError, true, 'baseline must keep the agent directory masked');
+  result = await invoke({ command, readPaths: [hidden] });
+  assert.equal(result.isError, false, JSON.stringify(result.content));
+  assert.match(JSON.stringify(result.content), /mock-only-host-resource/);
+  assert.ok(result.nestedCalls?.calls.some(call => call.name === 'scope_sandbox_authorize'), 'granular resource gate must retain nested provenance');
+  result = await invoke({ command });
+  assert.equal(result.isError, true, 'granular grant must not persist');
+  for (let i = 0; i < 2; i++) {
+    const before = reviewed.length;
+    result = await invoke({ command, host: true });
+    assert.equal(result.isError, false, JSON.stringify(result.content));
+    assert.match(JSON.stringify(result.content), /mock-only-host-resource/);
+    assert.ok(reviewed.length > before, 'each host call must reach the real permission chain');
+    assert.ok(result.nestedCalls?.calls.some(call => call.name === 'scope_host_authorize'));
+  }
+  result = await invoke({ command });
+  assert.equal(result.isError, true, 'host scope must not persist');
   assert.deepEqual(errors, []);
-  console.log('PASS: real Pi load, nested permission/authorizer gates, exact scope execution, refusal, and nested provenance (zero model calls)');
+  console.log('PASS: real Pi load, nested scope/host approval and refusal, one-call execution, baseline isolation, and nested provenance (zero model calls)');
 } finally {
   if (session) {
     await session.extensionRunner.emit({ type: 'session_shutdown' });

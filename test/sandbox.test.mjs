@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
 import { checkWriteRoot, executable, loadConfig } from '../src/config.mjs';
-import { plan, spawnSandbox } from '../src/sandbox.mjs';
+import { plan, planHost, runSandbox, spawnSandbox } from '../src/sandbox.mjs';
 import { fixture } from './helpers.mjs';
 
 const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
@@ -17,6 +17,25 @@ test('profile preserves literal command and orders writable mounts before protec
   assert.deepEqual(p.args.slice(-4), ['--noprofile', '--norc', '-c', command]);
   assert.ok(p.args.indexOf('--bind') < p.args.indexOf('--remount-ro'));
   assert.ok(plan(f.config, f.workspace, 'true', { network: true }, f.scratch).args.includes('--share-net'));
+});
+
+test('profile preserves private virtual filesystems and rejects granular overrides', t => {
+  const f = fixture(t);
+  const profile = plan(f.config, f.workspace, 'true', {}, f.scratch);
+  assert.ok(profile.args.includes('--proc') && profile.args.includes('/proc'));
+  assert.ok(profile.args.includes('--dev') && profile.args.includes('/dev'));
+  for (const path of ['/proc', '/proc/self/status', '/dev', '/dev/null']) {
+    assert.throws(() => plan(f.config, f.workspace, 'true', { readPaths: [path] }, f.scratch), /private virtual filesystem mounts/);
+  }
+});
+
+test('profile rejects a resource type changed after approval', t => {
+  const f = fixture(t);
+  const target = join(f.external, 'resource');
+  writeFileSync(target, 'file');
+  const scope = { readPaths: [target], resourceTypes: [{ path: target, kind: 'read', type: 'file' }] };
+  rmSync(target); mkdirSync(target);
+  assert.throws(() => plan(f.config, f.workspace, 'true', scope, f.scratch), /types changed/);
 });
 
 test('read-only profile never grants baseline write roots', t => {
@@ -53,6 +72,40 @@ test('absolute backend backing directory is protected and identity changes fail 
   assert.throws(() => checkWriteRoot(f.external, config), /protected/);
   writeFileSync(backend, '#!/bin/sh\nprintf replaced\n');
   assert.throws(() => plan(config, f.workspace, 'true', {}, f.scratch), /backend changed/);
+});
+
+test('host profile needs opt-in, uses the pinned shell and rejects a replaced shell', async t => {
+  const f = fixture(t);
+  assert.throws(() => planHost(f.config, f.workspace, 'true'), /disabled/);
+  const shell = join(f.external, 'shell');
+  writeFileSync(shell, '#!/bin/sh\nexit 0\n');
+  chmodSync(shell, 0o700);
+  const config = loadConfig(f.agent, f.home, f.extension, { shell, allowHost: true });
+  const invocation = planHost(config, f.workspace, 'printf host');
+  assert.equal(invocation.file, shell);
+  assert.deepEqual(invocation.args, ['--noprofile', '--norc', '-c', 'printf host']);
+  assert.equal(invocation.env.HOME, process.env.HOME);
+  assert.throws(() => checkWriteRoot(f.external, config), /protected/);
+  assert.throws(() => planHost(config, f.workspace, 'x'.repeat(16385)), /oversized/);
+  assert.throws(() => plan(config, f.workspace, 'true', { host: true }, f.scratch), /Host execution/);
+  await assert.rejects(runSandbox(config, f.workspace, 'true', { host: true, path: f.external }), /combined/);
+  writeFileSync(shell, '#!/bin/sh\nprintf changed\n');
+  assert.throws(() => planHost(config, f.workspace, 'true'), /shell changed/);
+  assert.throws(() => plan(config, f.workspace, 'true', {}, f.scratch), /shell changed/);
+});
+
+test('explicit host execution does not create sandbox metadata or retry a failed command', async t => {
+  const f = fixture(t, { allowHost: true });
+  const marker = join(f.external, 'attempts');
+  let output = '';
+  const result = await runSandbox(f.config, f.workspace, `printf x >> ${quote(marker)}; printf host-output; exit 7`, { host: true }, { onData: data => { output += data; } });
+  assert.equal(result.exitCode, 7);
+  assert.equal(output, 'host-output');
+  assert.equal(readFileSync(marker, 'utf8'), 'x');
+  assert.equal(existsSync(join(f.workspace, '.pi')), false);
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(runSandbox(f.config, f.workspace, 'true', { host: true }, { signal: controller.signal }), /aborted/);
 });
 
 test('process runner streams output and preserves nonzero status', async t => {

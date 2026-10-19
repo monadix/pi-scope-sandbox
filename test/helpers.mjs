@@ -12,7 +12,7 @@ export function fixture(t, override = {}, base = tmpdir()) {
 }
 
 export const FakeType = {
-  String: () => ({}), Boolean: () => ({}), Optional: x => x,
+  String: () => ({}), Boolean: () => ({}), Array: x => ({ items: x }), Optional: x => x,
   Object: properties => ({ properties }),
 };
 export const context = (cwd, sessionId = 'session-a') => ({
